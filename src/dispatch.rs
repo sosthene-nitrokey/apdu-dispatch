@@ -30,6 +30,7 @@ const MAX_INTERCHANGE_DATA: usize = if interchanges::SIZE < ResponseSize {
 
 pub use iso7816::Interface;
 
+#[derive(Clone, Copy)]
 pub enum RequestType {
     Select(Aid),
     /// Get Response including the Le field of the command
@@ -146,64 +147,6 @@ impl<'pipe> ApduDispatch<'pipe> {
         contactless_busy || contact_busy
     }
 
-    #[inline(never)]
-    fn buffer_chained_apdu_if_needed(
-        &mut self,
-        command: CommandView,
-        interface: Interface,
-    ) -> RequestType {
-        self.current_interface = interface;
-        // iso 7816-4 5.1.1
-        // check Apdu level chaining and buffer if necessary.
-        if !command.class().chain().not_the_last() {
-            let is_chaining = matches!(self.buffer.raw, RawApduBuffer::Request(_));
-
-            if is_chaining {
-                self.buffer.request(command);
-
-                // Response now needs to be chained.
-                self.was_request_chained = true;
-                info!("combined chained commands.");
-
-                RequestType::NewCommand
-            } else {
-                if self.buffer.raw == RawApduBuffer::None {
-                    self.was_request_chained = false;
-                }
-                let apdu_type = Self::apdu_type(command);
-                match Self::apdu_type(command) {
-                    // Keep buffer the same in case of GetResponse
-                    RequestType::GetResponse => (),
-                    // Overwrite for everything else.
-                    _ => self.buffer.request(command),
-                }
-                apdu_type
-            }
-        } else {
-            match interface {
-                // acknowledge
-                Interface::Contact => {
-                    self.contact
-                        .respond(Status::Success.try_into().unwrap())
-                        .expect("Could not respond");
-                }
-                Interface::Contactless => {
-                    self.contactless
-                        .respond(Status::Success.try_into().unwrap())
-                        .expect("Could not respond");
-                }
-            }
-
-            if !command.data().is_empty() {
-                info!("chaining {} bytes", command.data().len());
-                self.buffer.request(command);
-            }
-
-            // Nothing for the application to consume yet.
-            RequestType::None
-        }
-    }
-
     fn parse_apdu<const S: usize>(message: &interchanges::Data) -> Result<CommandView> {
         debug!(">> {}", hex_str!(message.as_slice(), sep:""));
         match CommandView::try_from(&**message) {
@@ -265,8 +208,55 @@ impl<'pipe> ApduDispatch<'pipe> {
         };
 
         self.response_len_expected = command.expected();
-        // The Apdu may be standalone or part of a chain.
-        self.buffer_chained_apdu_if_needed(command, interface)
+
+        // Perform command chaining with the buffered command if necessary.
+        // This cannot be extracted to another function because of conflicts between the lifetime
+        // of the command (borrowed from self) and self.
+
+        self.current_interface = interface;
+        // iso 7816-4 5.1.1
+        // check Apdu level chaining and buffer if necessary.
+        if command.class().chain().not_the_last() {
+            let success = Status::Success.try_into().unwrap();
+            match interface {
+                // acknowledge
+                Interface::Contact => self.contact.respond(success),
+                Interface::Contactless => self.contactless.respond(success),
+            }
+            .expect("Could not respond");
+
+            if !command.data().is_empty() {
+                info!("chaining {} bytes", command.data().len());
+                self.buffer.request(command);
+            }
+
+            // Nothing for the application to consume yet.
+            RequestType::None
+        } else {
+            let is_chaining = matches!(self.buffer.raw, RawApduBuffer::Request(_));
+
+            if is_chaining {
+                self.buffer.request(command);
+
+                // Response now needs to be chained.
+                self.was_request_chained = true;
+                info!("combined chained commands.");
+
+                RequestType::NewCommand
+            } else {
+                if self.buffer.raw == RawApduBuffer::None {
+                    self.was_request_chained = false;
+                }
+                let apdu_type = Self::apdu_type(command);
+                match apdu_type {
+                    // Keep buffer the same in case of GetResponse
+                    RequestType::GetResponse => (),
+                    // Overwrite for everything else.
+                    _ => self.buffer.request(command),
+                }
+                apdu_type
+            }
+        }
     }
 
     #[inline(never)]
