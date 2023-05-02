@@ -234,41 +234,39 @@ impl<'pipe> ApduDispatch<'pipe> {
 
     #[inline(never)]
     fn check_for_request(&mut self) -> RequestType {
-        if !self.busy() {
-            // Check to see if we have gotten a message, giving priority to contactless.
-            let (message, interface) = if let Some(message) = self.contactless.take_request() {
-                (message, Interface::Contactless)
-            } else if let Some(message) = self.contact.take_request() {
-                (message, Interface::Contact)
-            } else {
-                return RequestType::None;
-            };
-
-            // Parse the message as an APDU.
-            match Self::parse_apdu::<{ interchanges::SIZE }>(&message) {
-                Ok(command) => {
-                    self.response_len_expected = command.expected();
-                    // The Apdu may be standalone or part of a chain.
-                    self.buffer_chained_apdu_if_needed(command, interface)
-                }
-                Err(response) => {
-                    // If not a valid APDU, return error and don't pass to app.
-                    info!("Invalid apdu");
-                    match interface {
-                        Interface::Contactless => self
-                            .contactless
-                            .respond(response.into())
-                            .expect("cant respond"),
-                        Interface::Contact => {
-                            self.contact.respond(response.into()).expect("cant respond")
-                        }
-                    }
-                    RequestType::None
-                }
-            }
-        } else {
-            RequestType::None
+        if self.busy() {
+            return RequestType::None;
         }
+        // Check to see if we have gotten a message, giving priority to contactless.
+        let (message, interface) = if let Some(message) = self.contactless.take_request() {
+            (message, Interface::Contactless)
+        } else if let Some(message) = self.contact.take_request() {
+            (message, Interface::Contact)
+        } else {
+            return RequestType::None;
+        };
+
+        let command = match Self::parse_apdu::<{ interchanges::SIZE }>(&message) {
+            Ok(command) => command,
+            Err(response) => {
+                // If not a valid APDU, return error and don't pass to app.
+                info!("Invalid apdu");
+                match interface {
+                    Interface::Contactless => self
+                        .contactless
+                        .respond(response.into())
+                        .expect("cant respond"),
+                    Interface::Contact => {
+                        self.contact.respond(response.into()).expect("cant respond")
+                    }
+                }
+                return RequestType::None;
+            }
+        };
+
+        self.response_len_expected = command.expected();
+        // The Apdu may be standalone or part of a chain.
+        self.buffer_chained_apdu_if_needed(command, interface)
     }
 
     #[inline(never)]
