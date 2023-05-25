@@ -17,7 +17,10 @@ use crate::{
 };
 use core::convert::TryInto;
 
-use iso7816::{command::FromSliceError, Aid, Instruction, Result, Status};
+use iso7816::{
+    command::{CommandView, FromSliceError},
+    Aid, Instruction, Result, Status,
+};
 
 /// Maximum length of a data field of a response that can fit in an interchange message after
 /// concatenation of SW1SW2
@@ -51,17 +54,17 @@ struct ApduBuffer {
 }
 
 impl ApduBuffer {
-    fn request<const S: usize>(&mut self, command: &iso7816::Command<S>) {
+    fn request(&mut self, command: CommandView<'_>) {
         match &mut self.raw {
             RawApduBuffer::Request(buffered) => {
-                buffered.extend_from_command(command).ok();
+                buffered.extend_from_command_view(command).ok();
             }
             _ => {
                 if self.raw != RawApduBuffer::None {
                     info!("Was buffering the last response, but aborting that now for this new request.");
                 }
-                let mut new_cmd = iso7816::Command::try_from(&[0, 0, 0, 0]).unwrap();
-                new_cmd.extend_from_command(command).ok();
+                let mut new_cmd = iso7816::Command::try_from([0, 0, 0, 0].as_slice()).unwrap();
+                new_cmd.extend_from_command_view(command).ok();
                 self.raw = RawApduBuffer::Request(new_cmd);
             }
         }
@@ -85,9 +88,9 @@ pub struct ApduDispatch<'pipe> {
 }
 
 impl<'pipe> ApduDispatch<'pipe> {
-    fn apdu_type<const S: usize>(apdu: &iso7816::Command<S>) -> RequestType {
-        info!("instruction: {:?} {}", apdu.instruction(), apdu.p1);
-        if apdu.instruction() == Instruction::Select && (apdu.p1 & 0x04) != 0 {
+    fn apdu_type(apdu: CommandView<'_>) -> RequestType {
+        info!("instruction: {:?} {}", apdu.instruction(), apdu.p1());
+        if apdu.instruction() == Instruction::Select && (apdu.p1() & 0x04) != 0 {
             Aid::try_new(apdu.data()).map_or_else(
                 |_err| {
                     warn!("Failed to parse AID: {:?}", _err);
@@ -146,9 +149,9 @@ impl<'pipe> ApduDispatch<'pipe> {
     }
 
     #[inline(never)]
-    fn buffer_chained_apdu_if_needed<const S: usize>(
+    fn buffer_chained_apdu_if_needed(
         &mut self,
-        command: iso7816::Command<S>,
+        command: CommandView<'_>,
         interface: Interface,
     ) -> RequestType {
         self.current_interface = interface;
@@ -158,7 +161,7 @@ impl<'pipe> ApduDispatch<'pipe> {
             let is_chaining = matches!(self.buffer.raw, RawApduBuffer::Request(_));
 
             if is_chaining {
-                self.buffer.request(&command);
+                self.buffer.request(command);
 
                 // Response now needs to be chained.
                 self.was_request_chained = true;
@@ -169,12 +172,12 @@ impl<'pipe> ApduDispatch<'pipe> {
                 if self.buffer.raw == RawApduBuffer::None {
                     self.was_request_chained = false;
                 }
-                let apdu_type = Self::apdu_type(&command);
-                match Self::apdu_type(&command) {
+                let apdu_type = Self::apdu_type(command);
+                match Self::apdu_type(command) {
                     // Keep buffer the same in case of GetResponse
                     RequestType::GetResponse => (),
                     // Overwrite for everything else.
-                    _ => self.buffer.request(&command),
+                    _ => self.buffer.request(command),
                 }
                 apdu_type
             }
@@ -195,7 +198,7 @@ impl<'pipe> ApduDispatch<'pipe> {
 
             if !command.data().is_empty() {
                 info!("chaining {} bytes", command.data().len());
-                self.buffer.request(&command);
+                self.buffer.request(command);
             }
 
             // Nothing for the application to consume yet.
@@ -203,9 +206,9 @@ impl<'pipe> ApduDispatch<'pipe> {
         }
     }
 
-    fn parse_apdu<const S: usize>(message: &interchanges::Data) -> Result<iso7816::Command<S>> {
+    fn parse_apdu<const S: usize>(message: &interchanges::Data) -> Result<CommandView<'_>> {
         debug!(">> {}", hex_str!(message.as_slice(), sep:""));
-        match iso7816::Command::try_from(message) {
+        match CommandView::try_from(&**message) {
             Ok(command) => Ok(command),
             Err(_error) => {
                 info!("apdu bad");
